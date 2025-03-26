@@ -1,1 +1,152 @@
-"""尝试将STC(三元压缩)整合进FLAD中, 并评测其效果包括Residue(残差累积)模块"""import tensorflow as tfimport numpy as npdef approx_v(T, p):    """    估计稀疏化阈值v，选择前p%最大元素.    T: 模型更新的差异张量.    p: 稀疏率, 如0.001表示前0.1%的元素被保留.    """    T_flat = tf.reshape(tf.abs(T), -1)    k = tf.cast(tf.math.ceil(tf.size(T_flat, out_type=tf.float32) * p), tf.int32)    top_k, _ = tf.math.top_k(T_flat, k=k)    v = top_k[-1]  # 门槛    return v, top_kdef stc(T: tf.Tensor, hp):    """    STC稀疏三值压缩方法实现    T: 需要压缩的张量（模型差异）    hp: 超参数    返回压缩后的张量    """    hp_ = {'p': 0.1, 'approx': 1.0}    hp_.update(hp)    T_abs = tf.abs(T)    v, topk = approx_v(T_abs, hp_['p'])    mean = tf.reduce_mean(topk)    zeros = tf.zeros_like(T)    out_ = tf.where(T >= v, mean, zeros)    out = tf.where(T <= -v, -mean, out_)    return outdef decompress_stc(T_compressed):    """    因为STC只使用三值量化，因此解压缩就是直接返回压缩后的张量。    在实际应用中，这一步和压缩是对称的。    """    return T_compressed#  计算通讯量的方法def get_stc_update_size(T_compressed):    """    计算压缩后的STC模型更新通信量（MB）.    STC每个非零值使用1 bit表示，位置编码平均大约16 bit.    """    T_flat = tf.reshape(T_compressed, [-1])    k = tf.math.count_nonzero(T_flat, dtype=tf.float32)    total_bits = k * (1 + 16)  # 值编码1bit + 位置编码约16bits    size_MB = (total_bits / 8) / (1024**2)  # bits 转换为 MB    return size_MB.numpy()def calculate_compressed_update_size(compressed_update):    """    计算STC压缩后的通信量（MB）    compressed_update: 客户端压缩后的模型更新 (模型的各层)    每个非零值约17 bits (1位表示符号, 16位表示位置)    """    total_bits = 0    for layer in compressed_update:        nonzero_count = np.count_nonzero(layer)        bits_per_layer = nonzero_count * 17  # 每个非零元素17 bits        total_bits += bits_per_layer    size_MB = (total_bits / 8) / (1024 ** 2)  # bits转换为MB    return size_MB
+from functools import partial
+import torch
+import numpy as np
+import copy
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+#  辅助函数，用于估算稀疏化的阈值𝑣和前𝑝%元素的梯度值
+def approx_v(T, p, frac):
+    if frac < 1.0:
+        n_elements = T.numel()
+        n_sample = min(int(max(np.ceil(n_elements * frac), np.ceil(100 / p))), n_elements)  # ceil表示上取整
+        n_top = int(np.ceil(n_sample * p))
+
+        #  如果采样数等于张量总元素数则直接使用整个张量
+        if n_elements == n_sample:
+            i = 0
+        else:
+            i = np.random.randint(n_elements - n_sample)  # 随机选取一个起始位置i,用于划定采样范围
+
+        topk, _ = torch.topk(T.flatten()[i:i + n_sample], n_top)
+
+        #  此时说明采样不准确,通过递归调用来重新估算
+        if topk[-1] == 0.0 or topk[-1] == T.max():
+            return approx_v(T, p, 1.0)
+    else:
+        n_elements = T.numel()
+        n_top = int(np.ceil(n_elements * p))
+        topk, _ = torch.topk(T.flatten(), n_top)
+
+    return topk[-1], topk
+
+
+def none(T, hp):
+    """
+    Identity
+    """
+    return T
+
+
+def dgc(T, hp):
+    """
+    "Deep Gradient Compression: Reducing the communication Bandwidth for Distributed Training, Lin et al."
+    """
+    hp_ = {'p': 0.001, 'approx': 1.0}
+    hp_.update(hp)
+
+    if hp_['p'] >= 1.0:
+        return T
+
+    T_abs = torch.abs(T)
+
+    v, _ = approx_v(T_abs, hp_["p"], hp_["approx"])
+
+    out = torch.where(T_abs >= v, T, torch.Tensor([0.0]).to(device))
+
+    return out
+
+
+def stc(T, hp):
+    """
+    "Sparse Binary Compression: Towards Distributed Deep Learning with minimal Communication, Sattler et al."
+    """
+    hp_ = {'p': 0.001, 'approx': 1.0}
+    hp_.update(hp)
+
+    T_abs = torch.abs(T)
+
+    v, topk = approx_v(T_abs, hp_["p"], hp_["approx"])
+    mean = torch.mean(topk)
+
+    out_ = torch.where(T >= v, mean, torch.Tensor([0.0]).to(device))
+    out = torch.where(T <= -v, -mean, out_)
+
+    return out
+
+
+def signsgd(T, hp):
+    """
+    signSGD: Compressed Optimisation for non-convex Problems, Bernstein et al.
+    """
+    return T.sign()
+
+
+def compression_function(name, hp=None):
+    """
+    Returns a function that maps a tensor to a tensor of the same shape
+    """
+    return partial(globals()[name], hp=hp)
+
+
+###############################################################################################
+# COUNTING BITS
+###############################################################################################
+
+
+def get_bits(T, compression_method, approx=False):
+    """
+    Returns the number of bits that are required to communicate the Tensor T, which was compressed with compresion_method
+    """
+
+    B_val = {"none": 32, "dgc": 32, "stc": 1, "signsgd": 1}[compression_method]
+
+    # dense methods
+    if compression_method in ["none", "signsgd"]:
+        k = T.numel()  # 统计张量中元素个数
+        B_pos = 0
+
+    # sparse methods non-optimal encoding
+    elif compression_method in ["dgc"]:
+        k = torch.sum(T != 0.0).item()
+        B_pos = 16  # 位置编码每个非零值需要16位
+
+
+
+    # sparse methods golomb encoding
+    elif compression_method in ["stc"]:
+        k = torch.sum(T != 0.0).item()
+        N = T.numel()
+
+        #  Golomb编码
+        q = (k + 1) / (N + 1)
+        golden = (np.sqrt(5) + 1) / 2
+
+        if q == 1:
+            return B_val * T.numel()
+        if q == 0:
+            return 0
+
+        b_star = 1 + np.floor(np.log2(np.log(golden - 1) / np.log(1 - q)))
+
+        if approx:
+            B_pos = b_star + 1 / (1 - (1 - q) ** (2 ** b_star)) + 1
+        else:
+            idc = torch.nonzero(T.view(-1))
+            distances = idc[:] - torch.cat([torch.Tensor([[-1]]).long().to("cuda"), idc[:-1]])
+            B_pos = torch.mean(torch.ceil(distances.float() / 2 ** b_star)).item() + (b_star + 1)
+
+    b_total = (B_pos + B_val) * k
+
+    return b_total
+
+
+def get_update_size(dW, compression_method):
+    """
+    Returns the number of bits that are required to communicate the entire network dW, which was compressed with compresion_method
+    """
+    update_size = sum([get_bits(T, compression_method[0]) for T in dW.values()])
+
+    return update_size
