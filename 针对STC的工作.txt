@@ -1,0 +1,8 @@
+主要集中在修改flad_training.py文件
+
+
+v1: 添加了通讯量统计模块
+
+v2: 只添加STC方法，不包括缓存和Golomb-Enconding等
+
+v3: 尝试添加G-Enconding
