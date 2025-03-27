@@ -29,6 +29,10 @@ import shutil
 #  尝试导入压缩方法
 from compression_utils import stc, decompress_stc, calculate_compressed_update_size
 
+#  尝试导入Golomb编码
+from compression_utils import get_golomb_bits, calculate_compressed_update_size_golomb
+from compression_utils import golomb_encode_sparse,golomb_decode_sparse, calculate_true_encoded_size
+
 
 #  添加新的通信统计模块
 #  Tensorflow中参数为float32型
@@ -171,11 +175,14 @@ def FederatedTrain(clients, model_type, outdir, time_window, max_flow_len, datas
                 # STC压缩差异
                 model_diff_compressed = [stc(diff, stc_hp) for diff in model_diff]
 
-                # 存储压缩后的更新到client
-                client['compressed_update'] = model_diff_compressed
+                # 真实Golomb编码
+                encoded_update = [golomb_encode_sparse(layer) for layer in model_diff_compressed]
 
-                # 压缩后的通信量统计
-                compressed_size_MB = calculate_compressed_update_size(client['compressed_update'])
+                # 存储编码后的更新到client
+                client['compressed_encoded_update'] = encoded_update
+
+                # 真实计算通信量
+                compressed_size_MB = sum(calculate_true_encoded_size(layer) for layer in encoded_update)
                 round_communication += compressed_size_MB
 
                 # end
@@ -202,8 +209,10 @@ def FederatedTrain(clients, model_type, outdir, time_window, max_flow_len, datas
         # 对每一层分别聚合
         for layer_idx in range(num_layers):
             # 解压并聚合每个客户端对应层的更新
-            layer_updates = [decompress_stc(client['compressed_update'][layer_idx]) for client in client_subset]
-            aggregated_layer = np.mean(layer_updates, axis=0)  # 使用numpy均值聚合
+            layer_updates = [golomb_decode_sparse(client['compressed_encoded_update'][layer_idx])
+                             for client in client_subset]
+            aggregated_layer = np.mean(layer_updates, axis=0)
+
             aggregated_updates.append(aggregated_layer)
 
         # 更新服务器模型参数（服务器当前参数 + 聚合后的更新）
