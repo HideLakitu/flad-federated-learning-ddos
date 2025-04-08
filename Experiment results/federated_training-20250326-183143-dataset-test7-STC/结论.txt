@@ -1,0 +1,3 @@
+在只采用STC(含Golomb-Enconding)，但无Residue等机制的情况下，client的数量如果稍微多一些，
+
+则最终性能与不采用压缩相比会出现大幅下降。
