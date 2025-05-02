@@ -43,7 +43,7 @@ CLIENT_FRACTION = 0.8  # Fraction of clients selected at each round for FedAvg-b
 
 #  稀疏化比例,值为示意
 p = 0.1
-stc_hp = {'p': 0.01}
+stc_hp = {'p': 0.1}
 
 
 def trainClientModel(model, epochs, X_train, Y_train, X_val, Y_val, steps_per_epoch=None):
